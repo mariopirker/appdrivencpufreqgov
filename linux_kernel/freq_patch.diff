@@ -1,0 +1,189 @@
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+index 2cb9dc7..2bd04b6 100644
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -420,6 +420,8 @@
+ #define __NR_copy_file_range		(__NR_SYSCALL_BASE+391)
+ #define __NR_preadv2			(__NR_SYSCALL_BASE+392)
+ #define __NR_pwritev2			(__NR_SYSCALL_BASE+393)
++#define __NR_cpufreq_set_frequency      (__NR_SYSCALL_BASE+394)
++#define __NR_cpufreq_set_governer       (__NR_SYSCALL_BASE+395)
+ 
+ /*
+  * The following SWIs are ARM private.
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index 703fa0f..7bbdc29 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -403,6 +403,8 @@
+ 		CALL(sys_copy_file_range)
+ 		CALL(sys_preadv2)
+ 		CALL(sys_pwritev2)
++                CALL(sys_cpufreq_set_frequency)
++                CALL(sys_cpufreq_set_governer)
+ #ifndef syscalls_counted
+ .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
+ #define syscalls_counted
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index f848572..ae678ea 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -386,3 +386,5 @@
+ 377	i386	copy_file_range		sys_copy_file_range
+ 378	i386	preadv2			sys_preadv2			compat_sys_preadv2
+ 379	i386	pwritev2		sys_pwritev2			compat_sys_pwritev2
++380     i386    cpufreq_set_frequency   sys_cpufreq_set_frequency
++381     i386    cpufreq_set_governer   sys_cpufreq_set_governer
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index e9ce9c7..420eb22 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -335,6 +335,8 @@
+ 326	common	copy_file_range		sys_copy_file_range
+ 327	64	preadv2			sys_preadv2
+ 328	64	pwritev2		sys_pwritev2
++329     common  cpufreq_set_frequency   sys_cpufreq_set_frequency
++330     common  cpufreq_set_governer    sys_cpufreq_set_governer
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index d022390..c07dd2b 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -898,4 +898,6 @@ asmlinkage long sys_copy_file_range(int fd_in, loff_t __user *off_in,
+ 
+ asmlinkage long sys_mlock2(unsigned long start, size_t len, int flags);
+ 
++asmlinkage long sys_cpufreq_set_frequency(char __user * next_freq,int len,int cpu);
++asmlinkage long sys_cpufreq_set_governer(char __user *governer,int len,int cpu);
+ #endif
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index a26415b..428a4fb 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -725,8 +725,14 @@ __SC_COMP(__NR_preadv2, sys_preadv2, compat_sys_preadv2)
+ #define __NR_pwritev2 287
+ __SC_COMP(__NR_pwritev2, sys_pwritev2, compat_sys_pwritev2)
+ 
++
++#define __NR_cpufreq_set_frequency 288
++__SYSCALL(__NR_cpufreq_set_frequency,     sys_cpufreq_set_frequency)
++#define __NR_cpufreq_set_governer 289
++__SYSCALL(__NR_cpufreq_set_governer,     sys_cpufreq_set_governer)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 288
++#define __NR_syscalls 290
+ 
+ /*
+  * All syscalls below here should go away really,
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 89d5be4..0813ac8 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -41,6 +41,8 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/version.h>
+ #include <linux/ctype.h>
++#include <linux/cpufreq.h>
++#include <trace/events/power.h>
+ 
+ #include <linux/compat.h>
+ #include <linux/syscalls.h>
+@@ -53,6 +55,10 @@
+ #include <linux/uidgid.h>
+ #include <linux/cred.h>
+ 
++#include <asm/segment.h>
++#include <asm/uaccess.h>
++#include <linux/buffer_head.h>
++
+ #include <linux/kmsg_dump.h>
+ /* Move somewhere else to avoid recompiling? */
+ #include <generated/utsrelease.h>
+@@ -1212,6 +1218,73 @@ SYSCALL_DEFINE1(olduname, struct oldold_utsname __user *, name)
+ }
+ #endif
+ 
++SYSCALL_DEFINE3(cpufreq_set_frequency,  char __user *, next_freq, int, len, int, cpu)
++{
++        int errno = -EFAULT;
++        char tmp[__NEW_UTS_LEN];
++        struct file* filp = NULL;
++        mm_segment_t oldfs;
++        loff_t pos = 0;
++        char path[64];
++        char ch[2]="0";
++
++        strcpy(path,"/sys/devices/system/cpu/cpu");
++        ch[0]+=cpu;
++        strcat(path,ch);
++        strcat(path,"/cpufreq/scaling_setspeed");
++
++
++        copy_from_user(tmp, next_freq, len);
++        oldfs = get_fs();
++        set_fs(get_ds());
++        filp = filp_open(path, O_WRONLY|O_CREAT, 0644);
++        if(!filp) {
++                set_fs(oldfs);
++                PTR_ERR(filp);
++                return errno;
++        }
++
++        vfs_write(filp, tmp, strlen(tmp)+1, &pos);
++        set_fs(oldfs);
++
++        filp_close(filp, NULL);
++        return errno;
++}
++
++SYSCALL_DEFINE3(cpufreq_set_governer, char __user *, governer, int, len, int, cpu)
++{
++        int errno = -EFAULT;
++        char tmp[__NEW_UTS_LEN];
++        struct file* filp = NULL;
++        mm_segment_t oldfs;
++        loff_t pos = 0;
++        char path[64];
++        char ch[2]="0";
++
++        strcpy(path,"/sys/devices/system/cpu/cpu");
++        ch[0]+=cpu;
++        strcat(path,ch);
++        strcat(path,"/cpufreq/scaling_governor");
++
++        copy_from_user(tmp, governer, len);
++        oldfs = get_fs();
++        set_fs(get_ds());
++        filp = filp_open(path, O_WRONLY|O_CREAT, 0644);
++        if(!filp) {
++                set_fs(oldfs);
++                PTR_ERR(filp);
++                return errno;
++        } 
++                
++        vfs_write(filp,tmp, strlen(tmp)+1, &pos);
++        set_fs(oldfs);
++
++        filp_close(filp, NULL);      	
++        return errno;
++}
++
++
++
+ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
+ {
+ 	int errno;
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 2c5e3a8..0dae825 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -250,3 +250,6 @@ cond_syscall(sys_execveat);
+ 
+ /* membarrier */
+ cond_syscall(sys_membarrier);
++
++cond_syscall(sys_cpufreq_set_frequency);
++cond_syscall(sys_cpufreq_set_governer);
